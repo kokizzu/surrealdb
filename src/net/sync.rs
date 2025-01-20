@@ -1,22 +1,42 @@
-use warp::http;
-use warp::Filter;
+use crate::err::Error;
+use axum::response::IntoResponse;
+use axum::routing::get;
+use axum::{Extension, Router};
+use surrealdb::dbs::capabilities::RouteTarget;
 
-#[allow(opaque_hidden_inferred_bound)]
-pub fn config() -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
-	// Set base path
-	let base = warp::path("sync").and(warp::path::end());
-	// Set save method
-	let save = base.and(warp::get()).and_then(save);
-	// Set load method
-	let load = base.and(warp::post()).and_then(load);
-	// Specify route
-	save.or(load)
+use super::AppState;
+
+pub(super) fn router<S>() -> Router<S>
+where
+	S: Clone + Send + Sync + 'static,
+{
+	Router::new().route("/sync", get(save).post(load))
 }
 
-pub async fn load() -> Result<impl warp::Reply, warp::Rejection> {
-	Ok(warp::reply::with_status("Load", http::StatusCode::OK))
+async fn load(
+	Extension(state): Extension<AppState>,
+) -> Result<impl IntoResponse, impl IntoResponse> {
+	// Get the datastore reference
+	let db = &state.datastore;
+	// Check if capabilities allow querying the requested HTTP route
+	if !db.allows_http_route(&RouteTarget::Sync) {
+		warn!("Capabilities denied HTTP route request attempt, target: '{}'", &RouteTarget::Sync);
+		return Err(Error::ForbiddenRoute(RouteTarget::Sync.to_string()));
+	}
+
+	Ok("Load")
 }
 
-pub async fn save() -> Result<impl warp::Reply, warp::Rejection> {
-	Ok(warp::reply::with_status("Save", http::StatusCode::OK))
+async fn save(
+	Extension(state): Extension<AppState>,
+) -> Result<impl IntoResponse, impl IntoResponse> {
+	// Get the datastore reference
+	let db = &state.datastore;
+	// Check if capabilities allow querying the requested HTTP route
+	if !db.allows_http_route(&RouteTarget::Sync) {
+		warn!("Capabilities denied HTTP route request attempt, target: '{}'", &RouteTarget::Sync);
+		return Err(Error::ForbiddenRoute(RouteTarget::Sync.to_string()));
+	}
+
+	Ok("Save")
 }

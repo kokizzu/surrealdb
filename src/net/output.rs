@@ -1,7 +1,11 @@
+use axum::response::{IntoResponse, Response};
 use http::header::{HeaderValue, CONTENT_TYPE};
 use http::StatusCode;
 use serde::Serialize;
-use surrealdb::sql::serde::serialize_internal;
+use serde_json::Value as Json;
+use surrealdb::sql;
+
+use super::headers::Accept;
 
 pub enum Output {
 	None,
@@ -10,7 +14,7 @@ pub enum Output {
 	Json(Vec<u8>), // JSON
 	Cbor(Vec<u8>), // CBOR
 	Pack(Vec<u8>), // MessagePack
-	Cork(Vec<u8>), // Full type serialization
+	Full(Vec<u8>), // Full type serialization
 }
 
 pub fn none() -> Output {
@@ -35,8 +39,9 @@ pub fn cbor<T>(val: &T) -> Output
 where
 	T: Serialize,
 {
-	match serde_cbor::to_vec(val) {
-		Ok(v) => Output::Cbor(v),
+	let mut out = Vec::new();
+	match ciborium::into_writer(&val, &mut out) {
+		Ok(_) => Output::Cbor(out),
 		Err(_) => Output::Fail,
 	}
 }
@@ -51,48 +56,38 @@ where
 	}
 }
 
-pub fn cork<T>(val: &T) -> Output
+pub fn full<T>(val: &T) -> Output
 where
 	T: Serialize,
 {
-	match serialize_internal(|| serde_pack::to_vec(val)) {
-		Ok(v) => Output::Cork(v),
+	match surrealdb::sql::serde::serialize(val) {
+		Ok(v) => Output::Full(v),
 		Err(_) => Output::Fail,
 	}
 }
 
-impl warp::Reply for Output {
-	fn into_response(self) -> warp::reply::Response {
+/// Convert and simplify the value into JSON
+pub fn simplify<T: Serialize + 'static>(v: T) -> Json {
+	sql::to_value(v).unwrap().into()
+}
+
+impl IntoResponse for Output {
+	fn into_response(self) -> Response {
 		match self {
 			Output::Text(v) => {
-				let mut res = warp::reply::Response::new(v.into());
-				let con = HeaderValue::from_static("text/plain");
-				res.headers_mut().insert(CONTENT_TYPE, con);
-				res
+				([(CONTENT_TYPE, HeaderValue::from(Accept::TextPlain))], v).into_response()
 			}
 			Output::Json(v) => {
-				let mut res = warp::reply::Response::new(v.into());
-				let con = HeaderValue::from_static("application/json");
-				res.headers_mut().insert(CONTENT_TYPE, con);
-				res
+				([(CONTENT_TYPE, HeaderValue::from(Accept::ApplicationJson))], v).into_response()
 			}
 			Output::Cbor(v) => {
-				let mut res = warp::reply::Response::new(v.into());
-				let con = HeaderValue::from_static("application/cbor");
-				res.headers_mut().insert(CONTENT_TYPE, con);
-				res
+				([(CONTENT_TYPE, HeaderValue::from(Accept::ApplicationCbor))], v).into_response()
 			}
 			Output::Pack(v) => {
-				let mut res = warp::reply::Response::new(v.into());
-				let con = HeaderValue::from_static("application/pack");
-				res.headers_mut().insert(CONTENT_TYPE, con);
-				res
+				([(CONTENT_TYPE, HeaderValue::from(Accept::ApplicationPack))], v).into_response()
 			}
-			Output::Cork(v) => {
-				let mut res = warp::reply::Response::new(v.into());
-				let con = HeaderValue::from_static("application/cork");
-				res.headers_mut().insert(CONTENT_TYPE, con);
-				res
+			Output::Full(v) => {
+				([(CONTENT_TYPE, HeaderValue::from(Accept::Surrealdb))], v).into_response()
 			}
 			Output::None => StatusCode::OK.into_response(),
 			Output::Fail => StatusCode::INTERNAL_SERVER_ERROR.into_response(),

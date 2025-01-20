@@ -1,693 +1,195 @@
-use crate::cli::CF;
-use crate::cnf::MAX_CONCURRENT_CALLS;
-use crate::cnf::PKG_NAME;
-use crate::cnf::PKG_VERSION;
-use crate::cnf::WEBSOCKET_PING_FREQUENCY;
-use crate::dbs::DB;
-use crate::err::Error;
-use crate::net::session;
-use crate::net::LOG;
-use crate::rpc::args::Take;
-use crate::rpc::paths::{ID, METHOD, PARAMS};
-use crate::rpc::res;
-use crate::rpc::res::Failure;
-use crate::rpc::res::Output;
-use futures::{SinkExt, StreamExt};
-use once_cell::sync::Lazy;
-use serde::Serialize;
 use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::Arc;
-use surrealdb::channel;
-use surrealdb::channel::Sender;
+
+use super::headers::Accept;
+use super::headers::ContentType;
+use super::headers::SurrealId;
+use super::AppState;
+use crate::cnf;
+use crate::cnf::HTTP_MAX_RPC_BODY_SIZE;
+use crate::err::Error;
+use crate::rpc::connection::Connection;
+use crate::rpc::format::HttpFormat;
+use crate::rpc::post_context::PostRpcContext;
+use crate::rpc::response::IntoRpcResponse;
+use crate::rpc::RpcState;
+use axum::extract::DefaultBodyLimit;
+use axum::extract::State;
+use axum::routing::options;
+use axum::{
+	extract::ws::{WebSocket, WebSocketUpgrade},
+	response::IntoResponse,
+	Extension, Router,
+};
+use axum_extra::headers::Header;
+use axum_extra::TypedHeader;
+use bytes::Bytes;
+use http::header::SEC_WEBSOCKET_PROTOCOL;
+use http::HeaderMap;
+use surrealdb::dbs::capabilities::RouteTarget;
 use surrealdb::dbs::Session;
-use surrealdb::sql::Array;
-use surrealdb::sql::Object;
-use surrealdb::sql::Strand;
-use surrealdb::sql::Uuid;
-use surrealdb::sql::Value;
-use tokio::sync::RwLock;
-use warp::ws::{Message, WebSocket, Ws};
-use warp::Filter;
+use surrealdb::kvs::Datastore;
+use surrealdb::mem::ALLOC;
+use surrealdb::rpc::format::Format;
+use surrealdb::rpc::format::PROTOCOLS;
+use surrealdb::rpc::method::Method;
+use surrealdb::rpc::rpc_context::RpcContext;
+use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::request_id::RequestId;
+use uuid::Uuid;
 
-type WebSockets = RwLock<HashMap<Uuid, Sender<Message>>>;
-
-static WEBSOCKETS: Lazy<WebSockets> = Lazy::new(WebSockets::default);
-
-#[allow(opaque_hidden_inferred_bound)]
-pub fn config() -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
-	warp::path("rpc")
-		.and(warp::path::end())
-		.and(warp::ws())
-		.and(session::build())
-		.map(|ws: Ws, session: Session| ws.on_upgrade(move |ws| socket(ws, session)))
+pub(super) fn router() -> Router<Arc<RpcState>> {
+	Router::new()
+		.route("/rpc", options(|| async {}).get(get_handler).post(post_handler))
+		.route_layer(DefaultBodyLimit::disable())
+		.layer(RequestBodyLimitLayer::new(*HTTP_MAX_RPC_BODY_SIZE))
 }
 
-async fn socket(ws: WebSocket, session: Session) {
-	let rpc = Rpc::new(session);
-	Rpc::serve(rpc, ws).await
-}
-
-pub struct Rpc {
-	session: Session,
-	format: Output,
-	uuid: Uuid,
-	vars: BTreeMap<String, Value>,
-}
-
-impl Rpc {
-	/// Instantiate a new RPC
-	pub fn new(mut session: Session) -> Arc<RwLock<Rpc>> {
-		// Create a new RPC variables store
-		let vars = BTreeMap::new();
-		// Set the default output format
-		let format = Output::Json;
-		// Create a unique WebSocket id
-		let uuid = Uuid::new_v4();
-		// Enable real-time live queries
-		session.rt = true;
-		// Create and store the Rpc connection
-		Arc::new(RwLock::new(Rpc {
-			session,
-			format,
-			uuid,
-			vars,
-		}))
+async fn get_handler(
+	ws: WebSocketUpgrade,
+	Extension(state): Extension<AppState>,
+	Extension(id): Extension<RequestId>,
+	Extension(mut sess): Extension<Session>,
+	State(rpc_state): State<Arc<RpcState>>,
+	headers: HeaderMap,
+) -> Result<impl IntoResponse, impl IntoResponse> {
+	// Get the datastore reference
+	let db = &state.datastore;
+	// Check if capabilities allow querying the requested HTTP route
+	if !db.allows_http_route(&RouteTarget::Rpc) {
+		warn!("Capabilities denied HTTP route request attempt, target: '{}'", &RouteTarget::Rpc);
+		return Err(Error::ForbiddenRoute(RouteTarget::Rpc.to_string()));
 	}
-
-	/// Serve the RPC endpoint
-	pub async fn serve(rpc: Arc<RwLock<Rpc>>, ws: WebSocket) {
-		// Create a channel for sending messages
-		let (chn, mut rcv) = channel::new(MAX_CONCURRENT_CALLS);
-		// Split the socket into send and recv
-		let (mut wtx, mut wrx) = ws.split();
-		// Clone the channel for sending pings
-		let png = chn.clone();
-		// The WebSocket has connected
-		Rpc::connected(rpc.clone(), chn.clone()).await;
-		// Send messages to the client
-		tokio::task::spawn(async move {
-			// Create the interval ticker
-			let mut interval = tokio::time::interval(WEBSOCKET_PING_FREQUENCY);
-			// Loop indefinitely
-			loop {
-				// Wait for the timer
-				interval.tick().await;
-				// Create the ping message
-				let msg = Message::ping(vec![]);
-				// Send the message to the client
-				if png.send(msg).await.is_err() {
-					// Exit out of the loop
-					break;
+	// Check that a valid header has been specified
+	if headers.get(SEC_WEBSOCKET_PROTOCOL).is_none() {
+		warn!("A connection was made without a specified protocol.");
+		warn!("Automatic inference of the protocol format is deprecated in SurrealDB 2.0 and will be removed in SurrealDB 3.0.");
+		warn!("Please upgrade any client to ensure that the connection format is specified.");
+	}
+	// Check if there is a connection id header specified
+	let id = match headers.get(SurrealId::name()) {
+		// Use the specific SurrealDB id header when provided
+		Some(id) => {
+			match id.to_str() {
+				Ok(id) => {
+					// Attempt to parse the request id as a UUID
+					match Uuid::try_parse(id) {
+						// The specified request id was a valid UUID
+						Ok(id) => id,
+						// The specified request id was not a UUID
+						Err(_) => return Err(Error::Request),
+					}
 				}
+				Err(_) => return Err(Error::Request),
 			}
-		});
-		// Send messages to the client
-		tokio::task::spawn(async move {
-			// Wait for the next message to send
-			while let Some(res) = rcv.next().await {
-				// Send the message to the client
-				if let Err(err) = wtx.send(res).await {
-					// Output the WebSocket error to the logs
-					trace!(target: LOG, "WebSocket error: {:?}", err);
-					// It's already failed, so ignore error
-					let _ = wtx.close().await;
-					// Exit out of the loop
-					break;
-				}
-			}
-		});
-		// Get messages from the client
-		while let Some(msg) = wrx.next().await {
-			match msg {
-				// We've received a message from the client
-				Ok(msg) => match msg {
-					msg if msg.is_ping() => {
-						let _ = chn.send(Message::pong(vec![])).await;
-					}
-					msg if msg.is_text() => {
-						tokio::task::spawn(Rpc::call(rpc.clone(), msg, chn.clone()));
-					}
-					msg if msg.is_binary() => {
-						tokio::task::spawn(Rpc::call(rpc.clone(), msg, chn.clone()));
-					}
-					msg if msg.is_close() => {
-						break;
-					}
-					msg if msg.is_pong() => {
-						continue;
-					}
-					_ => {
-						// Ignore everything else
-					}
+		}
+		// Otherwise, use the generic WebSocket connection id header
+		None => match id.header_value().is_empty() {
+			// No request id was specified so create a new id
+			true => Uuid::new_v4(),
+			// A request id was specified to try to parse it
+			false => match id.header_value().to_str() {
+				// Attempt to parse the request id as a UUID
+				Ok(id) => match Uuid::try_parse(id) {
+					// The specified request id was a valid UUID
+					Ok(id) => id,
+					// The specified request id was not a UUID
+					Err(_) => return Err(Error::Request),
 				},
-				// There was an error receiving the message
-				Err(err) => {
-					// Output the WebSocket error to the logs
-					trace!(target: LOG, "WebSocket error: {:?}", err);
-					// Exit out of the loop
-					break;
-				}
-			}
-		}
-		// The WebSocket has disconnected
-		Rpc::disconnected(rpc.clone()).await;
+				// The request id contained invalid characters
+				Err(_) => return Err(Error::Request),
+			},
+		},
+	};
+	// Store connection id in session
+	sess.id = Some(id.to_string());
+	// Check if a connection with this id already exists
+	if rpc_state.web_sockets.read().await.contains_key(&id) {
+		return Err(Error::Request);
 	}
+	// Now let's upgrade the WebSocket connection
+	Ok(ws
+		// Set the potential WebSocket protocols
+		.protocols(PROTOCOLS)
+		// Set the maximum WebSocket frame size
+		.max_frame_size(*cnf::WEBSOCKET_MAX_FRAME_SIZE)
+		// Set the maximum WebSocket message size
+		.max_message_size(*cnf::WEBSOCKET_MAX_MESSAGE_SIZE)
+		// Set an error
+		.on_failed_upgrade(|err| {
+			warn!("Failed to upgrade WebSocket connection: {err}");
+		})
+		// Handle the WebSocket upgrade and process messages
+		.on_upgrade(move |socket| {
+			handle_socket(state.datastore.clone(), rpc_state, socket, sess, id)
+		}))
+}
 
-	async fn connected(rpc: Arc<RwLock<Rpc>>, chn: Sender<Message>) {
-		// Fetch the unique id of the WebSocket
-		let id = rpc.read().await.uuid.clone();
-		// Log that the WebSocket has connected
-		trace!(target: LOG, "WebSocket {} connected", id);
-		// Store this WebSocket in the list of WebSockets
-		WEBSOCKETS.write().await.insert(id, chn);
+async fn handle_socket(
+	datastore: Arc<Datastore>,
+	state: Arc<RpcState>,
+	ws: WebSocket,
+	sess: Session,
+	id: Uuid,
+) {
+	// Check if there is a WebSocket protocol specified
+	let format = match ws.protocol().and_then(|h| h.to_str().ok()) {
+		// Any selected protocol will always be a valie value
+		Some(protocol) => protocol.into(),
+		// No protocol format was specified
+		_ => Format::None,
+	};
+	// Create a new connection instance
+	let rpc = Connection::new(datastore, state, id, sess, format);
+	// Serve the socket connection requests
+	Connection::serve(rpc, ws).await;
+}
+
+async fn post_handler(
+	Extension(state): Extension<AppState>,
+	Extension(session): Extension<Session>,
+	accept: Option<TypedHeader<Accept>>,
+	content_type: TypedHeader<ContentType>,
+	body: Bytes,
+) -> Result<impl IntoResponse, impl IntoResponse> {
+	// Get the datastore reference
+	let db = &state.datastore;
+	// Check if capabilities allow querying the requested HTTP route
+	if !db.allows_http_route(&RouteTarget::Rpc) {
+		warn!("Capabilities denied HTTP route request attempt, target: '{}'", &RouteTarget::Rpc);
+		return Err(Error::ForbiddenRoute(RouteTarget::Rpc.to_string()));
 	}
-
-	async fn disconnected(rpc: Arc<RwLock<Rpc>>) {
-		// Fetch the unique id of the WebSocket
-		let id = rpc.read().await.uuid.clone();
-		// Log that the WebSocket has disconnected
-		trace!(target: LOG, "WebSocket {} disconnected", id);
-		// Remove this WebSocket from the list of WebSockets
-		WEBSOCKETS.write().await.remove(&id);
+	// Get the input format from the Content-Type header
+	let fmt: Format = content_type.deref().into();
+	// Check that the input format is a valid format
+	if matches!(fmt, Format::Unsupported | Format::None) {
+		return Err(Error::InvalidType);
 	}
-
-	/// Call RPC methods from the WebSocket
-	async fn call(rpc: Arc<RwLock<Rpc>>, msg: Message, chn: Sender<Message>) {
-		// Get the current output format
-		let mut out = { rpc.read().await.format.clone() };
-		// Clone the RPC
-		let rpc = rpc.clone();
-		// Parse the request
-		let req = match msg {
-			// This is a binary message
-			m if m.is_binary() => {
-				// Use binary output
-				out = Output::Full;
-				// Deserialize the input
-				Value::from(m.into_bytes())
-			}
-			// This is a text message
-			m if m.is_text() => {
-				// This won't panic due to the check above
-				let val = m.to_str().unwrap();
-				// Parse the SurrealQL object
-				match surrealdb::sql::json(val) {
-					// The SurrealQL message parsed ok
-					Ok(v) => v,
-					// The SurrealQL message failed to parse
-					_ => return res::failure(None, Failure::PARSE_ERROR).send(out, chn).await,
-				}
-			}
-			// Unsupported message type
-			_ => return res::failure(None, Failure::INTERNAL_ERROR).send(out, chn).await,
-		};
-		// Log the received request
-		trace!(target: LOG, "RPC Received: {}", req);
-		// Fetch the 'id' argument
-		let id = match req.pick(&*ID) {
-			v if v.is_none() => None,
-			v if v.is_null() => Some(v),
-			v if v.is_uuid() => Some(v),
-			v if v.is_number() => Some(v),
-			v if v.is_strand() => Some(v),
-			v if v.is_datetime() => Some(v),
-			_ => return res::failure(None, Failure::INVALID_REQUEST).send(out, chn).await,
-		};
-		// Fetch the 'method' argument
-		let method = match req.pick(&*METHOD) {
-			Value::Strand(v) => v.to_raw(),
-			_ => return res::failure(id, Failure::INVALID_REQUEST).send(out, chn).await,
-		};
-		// Fetch the 'params' argument
-		let params = match req.pick(&*PARAMS) {
-			Value::Array(v) => v,
-			_ => Array::new(),
-		};
-		// Match the method to a function
-		let res = match &method[..] {
-			// Handle a ping message
-			"ping" => Ok(Value::None),
-			// Retrieve the current auth record
-			"info" => match params.len() {
-				0 => rpc.read().await.info().await,
-				_ => return res::failure(id, Failure::INVALID_PARAMS).send(out, chn).await,
-			},
-			// Switch to a specific namespace and database
-			"use" => match params.needs_two() {
-				Ok((ns, db)) => rpc.write().await.yuse(ns, db).await,
-				_ => return res::failure(id, Failure::INVALID_PARAMS).send(out, chn).await,
-			},
-			// Signup to a specific authentication scope
-			"signup" => match params.needs_one() {
-				Ok(Value::Object(v)) => rpc.write().await.signup(v).await,
-				_ => return res::failure(id, Failure::INVALID_PARAMS).send(out, chn).await,
-			},
-			// Signin as a root, namespace, database or scope user
-			"signin" => match params.needs_one() {
-				Ok(Value::Object(v)) => rpc.write().await.signin(v).await,
-				_ => return res::failure(id, Failure::INVALID_PARAMS).send(out, chn).await,
-			},
-			// Invalidate the current authentication session
-			"invalidate" => match params.len() {
-				0 => rpc.write().await.invalidate().await,
-				_ => return res::failure(id, Failure::INVALID_PARAMS).send(out, chn).await,
-			},
-			// Authenticate using an authentication token
-			"authenticate" => match params.needs_one() {
-				Ok(Value::Strand(v)) => rpc.write().await.authenticate(v).await,
-				_ => return res::failure(id, Failure::INVALID_PARAMS).send(out, chn).await,
-			},
-			// Kill a live query using a query id
-			"kill" => match params.needs_one() {
-				Ok(v) if v.is_uuid() => rpc.read().await.kill(v).await,
-				_ => return res::failure(id, Failure::INVALID_PARAMS).send(out, chn).await,
-			},
-			// Setup a live query on a specific table
-			"live" => match params.needs_one() {
-				Ok(v) if v.is_table() => rpc.read().await.live(v).await,
-				Ok(v) if v.is_strand() => rpc.read().await.live(v).await,
-				_ => return res::failure(id, Failure::INVALID_PARAMS).send(out, chn).await,
-			},
-			// Specify a connection-wide parameter
-			"let" => match params.needs_one_or_two() {
-				Ok((Value::Strand(s), v)) => rpc.write().await.set(s, v).await,
-				_ => return res::failure(id, Failure::INVALID_PARAMS).send(out, chn).await,
-			},
-			// Specify a connection-wide parameter
-			"set" => match params.needs_one_or_two() {
-				Ok((Value::Strand(s), v)) => rpc.write().await.set(s, v).await,
-				_ => return res::failure(id, Failure::INVALID_PARAMS).send(out, chn).await,
-			},
-			// Unset and clear a connection-wide parameter
-			"unset" => match params.needs_one() {
-				Ok(Value::Strand(s)) => rpc.write().await.unset(s).await,
-				_ => return res::failure(id, Failure::INVALID_PARAMS).send(out, chn).await,
-			},
-			// Select a value or values from the database
-			"select" => match params.needs_one() {
-				Ok(v) => rpc.read().await.select(v).await,
-				_ => return res::failure(id, Failure::INVALID_PARAMS).send(out, chn).await,
-			},
-			// Create a value or values in the database
-			"create" => match params.needs_one_or_two() {
-				Ok((v, o)) => rpc.read().await.create(v, o).await,
-				_ => return res::failure(id, Failure::INVALID_PARAMS).send(out, chn).await,
-			},
-			// Update a value or values in the database using `CONTENT`
-			"update" => match params.needs_one_or_two() {
-				Ok((v, o)) => rpc.read().await.update(v, o).await,
-				_ => return res::failure(id, Failure::INVALID_PARAMS).send(out, chn).await,
-			},
-			// Update a value or values in the database using `MERGE`
-			"change" | "merge" => match params.needs_one_or_two() {
-				Ok((v, o)) => rpc.read().await.change(v, o).await,
-				_ => return res::failure(id, Failure::INVALID_PARAMS).send(out, chn).await,
-			},
-			// Update a value or values in the database using `PATCH`
-			"modify" | "patch" => match params.needs_one_or_two() {
-				Ok((v, o)) => rpc.read().await.modify(v, o).await,
-				_ => return res::failure(id, Failure::INVALID_PARAMS).send(out, chn).await,
-			},
-			// Delete a value or values from the database
-			"delete" => match params.needs_one() {
-				Ok(v) => rpc.read().await.delete(v).await,
-				_ => return res::failure(id, Failure::INVALID_PARAMS).send(out, chn).await,
-			},
-			// Specify the output format for text requests
-			"format" => match params.needs_one() {
-				Ok(Value::Strand(v)) => rpc.write().await.format(v).await,
-				_ => return res::failure(id, Failure::INVALID_PARAMS).send(out, chn).await,
-			},
-			// Get the current server version
-			"version" => match params.len() {
-				0 => Ok(format!("{PKG_NAME}-{}", *PKG_VERSION).into()),
-				_ => return res::failure(id, Failure::INVALID_PARAMS).send(out, chn).await,
-			},
-			// Run a full SurrealQL query against the database
-			"query" => match params.needs_one_or_two() {
-				Ok((Value::Strand(s), o)) if o.is_none_or_null() => {
-					return match rpc.read().await.query(s).await {
-						Ok(v) => res::success(id, v).send(out, chn).await,
-						Err(e) => {
-							res::failure(id, Failure::custom(e.to_string())).send(out, chn).await
-						}
-					};
-				}
-				Ok((Value::Strand(s), Value::Object(o))) => {
-					return match rpc.read().await.query_with(s, o).await {
-						Ok(v) => res::success(id, v).send(out, chn).await,
-						Err(e) => {
-							res::failure(id, Failure::custom(e.to_string())).send(out, chn).await
-						}
-					};
-				}
-				_ => return res::failure(id, Failure::INVALID_PARAMS).send(out, chn).await,
-			},
-			_ => return res::failure(id, Failure::METHOD_NOT_FOUND).send(out, chn).await,
-		};
-		// Return the final response
-		match res {
-			Ok(v) => res::success(id, v).send(out, chn).await,
-			Err(e) => res::failure(id, Failure::custom(e.to_string())).send(out, chn).await,
+	// Get the output format from the Accept header
+	let out: Option<Format> = accept.as_deref().map(Into::into);
+	// Check that the input format and the output format match
+	if let Some(out) = out {
+		if fmt != out {
+			return Err(Error::InvalidType);
 		}
 	}
-
-	// ------------------------------
-	// Methods for authentication
-	// ------------------------------
-
-	async fn format(&mut self, out: Strand) -> Result<Value, Error> {
-		match out.as_str() {
-			"json" | "application/json" => self.format = Output::Json,
-			"cbor" | "application/cbor" => self.format = Output::Cbor,
-			"pack" | "application/pack" => self.format = Output::Pack,
-			_ => return Err(Error::InvalidType),
-		};
-		Ok(Value::None)
+	// Create a new HTTP instance
+	let mut rpc = PostRpcContext::new(&state.datastore, session, BTreeMap::new());
+	// Check to see available memory
+	if ALLOC.is_beyond_threshold() {
+		return Err(Error::ServerOverloaded);
 	}
-
-	async fn yuse(&mut self, ns: Value, db: Value) -> Result<Value, Error> {
-		if let Value::Strand(ns) = ns {
-			self.session.ns = Some(ns.0);
+	// Parse the HTTP request body
+	match fmt.req_http(body) {
+		Ok(req) => {
+			// Parse the request RPC method type
+			let method = Method::parse(req.method);
+			// Execute the specified method
+			let res = rpc.execute_mutable(method, req.params).await;
+			// Return the HTTP response
+			fmt.res_http(res.into_response(None)).map_err(Error::from)
 		}
-		if let Value::Strand(db) = db {
-			self.session.db = Some(db.0);
-		}
-		Ok(Value::None)
-	}
-
-	async fn signup(&mut self, vars: Object) -> Result<Value, Error> {
-		crate::iam::signup::signup(&mut self.session, vars)
-			.await
-			.map(Into::into)
-			.map_err(Into::into)
-	}
-
-	async fn signin(&mut self, vars: Object) -> Result<Value, Error> {
-		crate::iam::signin::signin(&mut self.session, vars)
-			.await
-			.map(Into::into)
-			.map_err(Into::into)
-	}
-
-	async fn invalidate(&mut self) -> Result<Value, Error> {
-		crate::iam::clear::clear(&mut self.session).await?;
-		Ok(Value::None)
-	}
-
-	async fn authenticate(&mut self, token: Strand) -> Result<Value, Error> {
-		crate::iam::verify::token(&mut self.session, token.0).await?;
-		Ok(Value::None)
-	}
-
-	// ------------------------------
-	// Methods for identification
-	// ------------------------------
-
-	async fn info(&self) -> Result<Value, Error> {
-		// Get a database reference
-		let kvs = DB.get().unwrap();
-		// Get local copy of options
-		let opt = CF.get().unwrap();
-		// Specify the SQL query string
-		let sql = "SELECT * FROM $auth";
-		// Execute the query on the database
-		let mut res = kvs.execute(sql, &self.session, None, opt.strict).await?;
-		// Extract the first value from the result
-		let res = res.remove(0).result?.first();
-		// Return the result to the client
-		Ok(res)
-	}
-
-	// ------------------------------
-	// Methods for setting variables
-	// ------------------------------
-
-	async fn set(&mut self, key: Strand, val: Value) -> Result<Value, Error> {
-		match val {
-			// Remove the variable if undefined
-			Value::None => self.vars.remove(&key.0),
-			// Store the variable if defined
-			v => self.vars.insert(key.0, v),
-		};
-		Ok(Value::Null)
-	}
-
-	async fn unset(&mut self, key: Strand) -> Result<Value, Error> {
-		self.vars.remove(&key.0);
-		Ok(Value::Null)
-	}
-
-	// ------------------------------
-	// Methods for live queries
-	// ------------------------------
-
-	async fn kill(&self, id: Value) -> Result<Value, Error> {
-		// Get a database reference
-		let kvs = DB.get().unwrap();
-		// Get local copy of options
-		let opt = CF.get().unwrap();
-		// Specify the SQL query string
-		let sql = "KILL $id";
-		// Specify the query parameters
-		let var = Some(map! {
-			String::from("id") => id,
-			=> &self.vars
-		});
-		// Execute the query on the database
-		let mut res = kvs.execute(sql, &self.session, var, opt.strict).await?;
-		// Extract the first query result
-		let res = res.remove(0).result?;
-		// Return the result to the client
-		Ok(res)
-	}
-
-	async fn live(&self, tb: Value) -> Result<Value, Error> {
-		// Get a database reference
-		let kvs = DB.get().unwrap();
-		// Get local copy of options
-		let opt = CF.get().unwrap();
-		// Specify the SQL query string
-		let sql = "LIVE SELECT * FROM $tb";
-		// Specify the query parameters
-		let var = Some(map! {
-			String::from("tb") => tb.could_be_table(),
-			=> &self.vars
-		});
-		// Execute the query on the database
-		let mut res = kvs.execute(sql, &self.session, var, opt.strict).await?;
-		// Extract the first query result
-		let res = res.remove(0).result?;
-		// Return the result to the client
-		Ok(res)
-	}
-
-	// ------------------------------
-	// Methods for selecting
-	// ------------------------------
-
-	async fn select(&self, what: Value) -> Result<Value, Error> {
-		// Return a single result?
-		let one = what.is_thing();
-		// Get a database reference
-		let kvs = DB.get().unwrap();
-		// Get local copy of options
-		let opt = CF.get().unwrap();
-		// Specify the SQL query string
-		let sql = "SELECT * FROM $what";
-		// Specify the query parameters
-		let var = Some(map! {
-			String::from("what") => what.could_be_table(),
-			=> &self.vars
-		});
-		// Execute the query on the database
-		let mut res = kvs.execute(sql, &self.session, var, opt.strict).await?;
-		// Extract the first query result
-		let res = match one {
-			true => res.remove(0).result?.first(),
-			false => res.remove(0).result?,
-		};
-		// Return the result to the client
-		Ok(res)
-	}
-
-	// ------------------------------
-	// Methods for creating
-	// ------------------------------
-
-	async fn create(&self, what: Value, data: Value) -> Result<Value, Error> {
-		// Return a single result?
-		let one = what.is_thing();
-		// Get a database reference
-		let kvs = DB.get().unwrap();
-		// Get local copy of options
-		let opt = CF.get().unwrap();
-		// Specify the SQL query string
-		let sql = "CREATE $what CONTENT $data RETURN AFTER";
-		// Specify the query parameters
-		let var = Some(map! {
-			String::from("what") => what.could_be_table(),
-			String::from("data") => data,
-			=> &self.vars
-		});
-		// Execute the query on the database
-		let mut res = kvs.execute(sql, &self.session, var, opt.strict).await?;
-		// Extract the first query result
-		let res = match one {
-			true => res.remove(0).result?.first(),
-			false => res.remove(0).result?,
-		};
-		// Return the result to the client
-		Ok(res)
-	}
-
-	// ------------------------------
-	// Methods for updating
-	// ------------------------------
-
-	async fn update(&self, what: Value, data: Value) -> Result<Value, Error> {
-		// Return a single result?
-		let one = what.is_thing();
-		// Get a database reference
-		let kvs = DB.get().unwrap();
-		// Get local copy of options
-		let opt = CF.get().unwrap();
-		// Specify the SQL query string
-		let sql = "UPDATE $what CONTENT $data RETURN AFTER";
-		// Specify the query parameters
-		let var = Some(map! {
-			String::from("what") => what.could_be_table(),
-			String::from("data") => data,
-			=> &self.vars
-		});
-		// Execute the query on the database
-		let mut res = kvs.execute(sql, &self.session, var, opt.strict).await?;
-		// Extract the first query result
-		let res = match one {
-			true => res.remove(0).result?.first(),
-			false => res.remove(0).result?,
-		};
-		// Return the result to the client
-		Ok(res)
-	}
-
-	// ------------------------------
-	// Methods for changing
-	// ------------------------------
-
-	async fn change(&self, what: Value, data: Value) -> Result<Value, Error> {
-		// Return a single result?
-		let one = what.is_thing();
-		// Get a database reference
-		let kvs = DB.get().unwrap();
-		// Get local copy of options
-		let opt = CF.get().unwrap();
-		// Specify the SQL query string
-		let sql = "UPDATE $what MERGE $data RETURN AFTER";
-		// Specify the query parameters
-		let var = Some(map! {
-			String::from("what") => what.could_be_table(),
-			String::from("data") => data,
-			=> &self.vars
-		});
-		// Execute the query on the database
-		let mut res = kvs.execute(sql, &self.session, var, opt.strict).await?;
-		// Extract the first query result
-		let res = match one {
-			true => res.remove(0).result?.first(),
-			false => res.remove(0).result?,
-		};
-		// Return the result to the client
-		Ok(res)
-	}
-
-	// ------------------------------
-	// Methods for modifying
-	// ------------------------------
-
-	async fn modify(&self, what: Value, data: Value) -> Result<Value, Error> {
-		// Return a single result?
-		let one = what.is_thing();
-		// Get a database reference
-		let kvs = DB.get().unwrap();
-		// Get local copy of options
-		let opt = CF.get().unwrap();
-		// Specify the SQL query string
-		let sql = "UPDATE $what PATCH $data RETURN DIFF";
-		// Specify the query parameters
-		let var = Some(map! {
-			String::from("what") => what.could_be_table(),
-			String::from("data") => data,
-			=> &self.vars
-		});
-		// Execute the query on the database
-		let mut res = kvs.execute(sql, &self.session, var, opt.strict).await?;
-		// Extract the first query result
-		let res = match one {
-			true => res.remove(0).result?.first(),
-			false => res.remove(0).result?,
-		};
-		// Return the result to the client
-		Ok(res)
-	}
-
-	// ------------------------------
-	// Methods for deleting
-	// ------------------------------
-
-	async fn delete(&self, what: Value) -> Result<Value, Error> {
-		// Return a single result?
-		let one = what.is_thing();
-		// Get a database reference
-		let kvs = DB.get().unwrap();
-		// Get local copy of options
-		let opt = CF.get().unwrap();
-		// Specify the SQL query string
-		let sql = "DELETE $what";
-		// Specify the query parameters
-		let var = Some(map! {
-			String::from("what") => what.could_be_table(),
-			=> &self.vars
-		});
-		// Execute the query on the database
-		let mut res = kvs.execute(sql, &self.session, var, opt.strict).await?;
-		// Extract the first query result
-		let res = match one {
-			true => res.remove(0).result?.first(),
-			false => res.remove(0).result?,
-		};
-		// Return the result to the client
-		Ok(res)
-	}
-
-	// ------------------------------
-	// Methods for querying
-	// ------------------------------
-
-	async fn query(&self, sql: Strand) -> Result<impl Serialize, Error> {
-		// Get a database reference
-		let kvs = DB.get().unwrap();
-		// Get local copy of options
-		let opt = CF.get().unwrap();
-		// Specify the query parameters
-		let var = Some(self.vars.clone());
-		// Execute the query on the database
-		let res = kvs.execute(&sql, &self.session, var, opt.strict).await?;
-		// Return the result to the client
-		Ok(res)
-	}
-
-	async fn query_with(&self, sql: Strand, mut vars: Object) -> Result<impl Serialize, Error> {
-		// Get a database reference
-		let kvs = DB.get().unwrap();
-		// Get local copy of options
-		let opt = CF.get().unwrap();
-		// Specify the query parameters
-		let var = Some(mrg! { vars.0, &self.vars });
-		// Execute the query on the database
-		let res = kvs.execute(&sql, &self.session, var, opt.strict).await?;
-		// Return the result to the client
-		Ok(res)
+		Err(err) => Err(Error::from(err)),
 	}
 }

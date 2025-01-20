@@ -1,14 +1,33 @@
 use crate::cnf::PKG_NAME;
 use crate::cnf::PKG_VERSION;
-use warp::http;
-use warp::Filter;
+use crate::err::Error;
+use axum::response::IntoResponse;
+use axum::routing::get;
+use axum::{Extension, Router};
+use surrealdb::dbs::capabilities::RouteTarget;
 
-#[allow(opaque_hidden_inferred_bound)]
-pub fn config() -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
-	warp::path("version").and(warp::path::end()).and(warp::get()).and_then(handler)
+use super::AppState;
+
+pub(super) fn router<S>() -> Router<S>
+where
+	S: Clone + Send + Sync + 'static,
+{
+	Router::new().route("/version", get(handler))
 }
 
-pub async fn handler() -> Result<impl warp::Reply, warp::Rejection> {
-	let val = format!("{PKG_NAME}-{}", *PKG_VERSION);
-	Ok(warp::reply::with_status(val, http::StatusCode::OK))
+async fn handler(
+	Extension(state): Extension<AppState>,
+) -> Result<impl IntoResponse, impl IntoResponse> {
+	// Get the datastore reference
+	let db = &state.datastore;
+	// Check if capabilities allow querying the requested HTTP route
+	if !db.allows_http_route(&RouteTarget::Version) {
+		warn!(
+			"Capabilities denied HTTP route request attempt, target: '{}'",
+			&RouteTarget::Version
+		);
+		return Err(Error::ForbiddenRoute(RouteTarget::Version.to_string()));
+	}
+
+	Ok(format!("{PKG_NAME}-{}", *PKG_VERSION))
 }

@@ -1,16 +1,25 @@
+use crate::cli::abstraction::DatabaseConnectionArguments;
 use crate::err::Error;
+use clap::Args;
 use surrealdb::engine::any::connect;
 
-#[tokio::main]
-pub async fn init(matches: &clap::ArgMatches) -> Result<(), Error> {
-	// Set the default logging level
-	crate::cli::log::init(0);
-	// Parse all other cli arguments
-	let endpoint = matches.value_of("conn").unwrap();
+#[derive(Args, Debug)]
+pub struct IsReadyCommandArguments {
+	#[command(flatten)]
+	conn: DatabaseConnectionArguments,
+}
+
+pub async fn init(
+	IsReadyCommandArguments {
+		conn: DatabaseConnectionArguments {
+			endpoint,
+		},
+	}: IsReadyCommandArguments,
+) -> Result<(), Error> {
 	// Connect to the database engine
-	let client = connect(endpoint).await?;
-	// Check if the database engine is healthy
-	client.health().await?;
+	connect(endpoint).await?;
+	// Log output ok
 	println!("OK");
+	// All ok
 	Ok(())
 }

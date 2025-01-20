@@ -7,7 +7,7 @@ let
     features = with pkgs.lib; lists.unique (lists.flatten featureLists);
   in map (feature: "--features=${feature}") features;
 
-  craneLib = (crane.mkLib pkgs).overrideScope' (final: prev: {
+  craneLib = (crane.mkLib pkgs).overrideScope (final: prev: {
     cargo = rustToolchain;
     rustc = rustToolchain;
   });
@@ -24,4 +24,5 @@ let
 in craneLib.buildPackage (buildSpec // {
   inherit cargoArtifacts;
   inherit (util) version SURREAL_BUILD_METADATA;
+
 })

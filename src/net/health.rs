@@ -1,25 +1,50 @@
-use crate::dbs::DB;
+use super::AppState;
 use crate::err::Error;
-use warp::Filter;
+use axum::response::IntoResponse;
+use axum::routing::get;
+use axum::Extension;
+use axum::Router;
+use surrealdb::dbs::capabilities::RouteTarget;
+use surrealdb::kvs::{LockType::*, TransactionType::*};
 
-#[allow(opaque_hidden_inferred_bound)]
-pub fn config() -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
-	warp::path("health").and(warp::path::end()).and(warp::get()).and_then(handler)
+pub(super) fn router<S>() -> Router<S>
+where
+	S: Clone + Send + Sync + 'static,
+{
+	Router::new().route("/health", get(handler))
 }
 
-async fn handler() -> Result<impl warp::Reply, warp::Rejection> {
+async fn handler(Extension(state): Extension<AppState>) -> impl IntoResponse {
 	// Get the datastore reference
-	let db = DB.get().unwrap();
+	let db = &state.datastore;
+	// Check if capabilities allow querying the requested HTTP route
+	if !db.allows_http_route(&RouteTarget::Health) {
+		warn!("Capabilities denied HTTP route request attempt, target: '{}'", &RouteTarget::Health);
+		return Err(Error::ForbiddenRoute(RouteTarget::Health.to_string()));
+	}
 	// Attempt to open a transaction
-	match db.transaction(false, false).await {
+	match db.transaction(Read, Optimistic).await {
 		// The transaction failed to start
-		Err(_) => Err(warp::reject::custom(Error::InvalidStorage)),
+		Err(_) => Err(Error::InvalidStorage),
 		// The transaction was successful
-		Ok(mut tx) => {
+		Ok(tx) => {
 			// Cancel the transaction
-			let _ = tx.cancel().await;
-			// Return the response
-			Ok(warp::reply())
+			trace!("Health endpoint cancelling transaction");
+			// Attempt to fetch data
+			match tx.get(vec![0x00], None).await {
+				Err(_) => {
+					// Ensure the transaction is cancelled
+					let _ = tx.cancel().await;
+					// Return an error for this endpoint
+					Err(Error::InvalidStorage)
+				}
+				Ok(_) => {
+					// Ensure the transaction is cancelled
+					let _ = tx.cancel().await;
+					// Return success for this endpoint
+					Ok(())
+				}
+			}
 		}
 	}
 }

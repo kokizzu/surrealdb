@@ -10,12 +10,17 @@
 
     nativeBuildInputs = [ pkg-config ];
 
-    buildInputs = [ openssl binutils ];
+    buildInputs = [ openssl binutils onnxruntime ];
 
     CARGO_BUILD_TARGET = target;
 
     LIBCLANG_PATH = "${llvmPackages.libclang.lib}/lib";
 
+    PROTOC = "${protobuf}/bin/protoc";
+    PROTOC_INCLUDE = "${protobuf}/include";
+
     OPENSSL_NO_VENDOR = "true";
+
+    ONNXRUNTIME_LIB_PATH = "${onnxruntime.outPath}/lib/libonnxruntime.so";
   };
 }
